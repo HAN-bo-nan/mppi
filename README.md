@@ -1,98 +1,77 @@
-# Minimal_TEB
+# Mppi
+## calc_control_input
+输入：$x_0$ xf，xf，xg   
 
-<img src='https://img.shields.io/badge/Python-3.9-blue' alt='bilibili'></a>
-<a href="https://github.com/hanruihua/ir-sim"><img src='https://img.shields.io/badge/ir--sim-2.5.0-lightgreen' alt='Paper BibTex'></a>
-<a href="https://github.com/casadi"><img src='https://img.shields.io/badge/casadi-3.7.0-red' alt='ROS'></a>
+x0：当前状态 x0 = x,y,yaw,v   
 
----
+xf: 参考路径 xf = x,y    
 
-This project implements a simplified version of the TEB (Time Elastic Band) algorithm based on the [IR-SIM](https://github.com/hanruihua/ir-sim) platform. This implementation focuses on learning, retaining the core logic of TEB while simplifying the algorithm flow to facilitate understanding and learning.
+xg: 目标点   xg = x,y
 
-# Project Structure Overview
+    def _calc_epsilon(self, sigma, K, T, dim_u):
+        """生成高斯噪声序列"""
+        mu = np.zeros((dim_u))
+        epsilon = np.random.multivariate_normal(mu, sigma, (K, T))
+        return epsilon
 
-- [run.py](#runpy)
-- [sim.py](#simpy)
-- [TebSolver.py](#tebsolverpy)
+k是路径数量，T是步数，diu_u则是控制量的维度一般是2  
+最后生成一个shape(k,T,dim_u)的矩阵，相当于生成噪声控制    
 
-## run.py
+    for k in range(self.K):
+            x = x0
+            for t in range(1, self.T + 1):
+                # 根据探索率生成控制序列
+                if k < (1.0 - self.param_exploration) * self.K:
+                    v[k, t - 1] = u[t - 1] + epsilon[k, t - 1]
+                else:
+                    v[k, t - 1] = epsilon[k, t - 1]
 
-**Project Entry Script**
+                # 限制控制输入范围
+                v_clamped = self._u_clamp(v[k, t - 1])
+                # 更新状态
+                x = self._next_x(x, v_clamped)
+                # 累积成本
+                S[k] += 10*self._stage_cost(x) + self.input_cost_weight * np.linalg.norm( u[t - 1]) ** 2 + 10*self.param_gamma * u[t - 1].T @ np.linalg.inv(self.sigma) @ v[k, t - 1]
 
-| Functionality       | Description                                                                       |
-| ------------------- | --------------------------------------------------------------------------------- |
-| Import & Initialize | Import the `SIM_ENV` class and instantiate it with rendering enabled.             |
-| Main Loop           | Iterate 3000 times, advancing the simulation via `env.step()` each iteration.     |
-| Termination         | Save the animation and exit the loop when the robot reaches the goal or collides. |
+            # 添加终端成本
+            S[k] += 10*self._terminal_cost(x)
 
----
+上述代码是将赏赐最优控制的一部分添加了噪声一部分没有添加噪声，添加的比例与‘param_exploration‘有关   
+将添加的噪声的控制进行裁剪使其符合机器人的输出范围，下面是裁剪函数  
 
-## sim.py
 
-**Simulation Environment Logic**
+          def _u_clamp(self, u):
+        """限制控制输入在可行范围内"""
+        u[0] = np.clip(u[0], -self.max_steer_abs, self.max_steer_abs)
+        u[1] = np.clip(u[1], -self.max_accel_abs, self.max_accel_abs)
+        return u
+开始计算累积成本 ：   S[k] += 10*self._stage_cost(x) + self.input_cost_weight * np.linalg.norm( u[t - 1]) ** 2 + 10*self.param_gamma * u[t - 1].T @ np.linalg.inv(self.sigma) @ v[k, t - 1]
+这部分中：state_cost是状态成本，内容如下：  
+stage_cost_weight 是状态中四个参数的权重，这个state_cost分别计算了当前位置与参考点的x，y,yaw这三个参数的相对误差
 
-| Module            | Responsibility                                                                                     |
-| ----------------- | -------------------------------------------------------------------------------------------------- |
-| Initialization    | Build the simulation environment on top of `ir-sim.EnvBase`.                                       |
-| Global Planning   | Generate a global path from start to goal using the **A\*** algorithm.                             |
-| Local Planning    | Call `TebplanSolver` to obtain a locally optimal trajectory.                                       |
-| Sensor Processing | Cluster LiDAR data to extract obstacles.                                                           |
-| Robot Control     | Compute linear/angular velocities, execute simulation steps, and determine termination conditions. |
+        def _stage_cost(self, x_t):
+        """计算阶段成本"""
+        x, y, yaw, v = x_t
+        yaw = ((yaw + 2.0 * np.pi) % (2.0 * np.pi))
 
----
 
-## TebSolver.py
+        stage_cost = self.stage_cost_weight[0] * (x - self.xf[0]) ** 2 + \
+                     self.stage_cost_weight[1] * (y - self.xf[1]) ** 2 + \
+                     self.stage_cost_weight[2] * (yaw - 5.498) ** 2 
 
-**TEB (Time Elastic Band) Local Path Planner**
+        return stage_cost
 
-| Dimension   | Content                                                                                                            |
-| ----------- | ------------------------------------------------------------------------------------------------------------------ |
-| Modeling    | Formulate a nonlinear programming (NLP) problem with **CasADi**.                                                   |
-| Objective   | Path smoothness + time penalty + kinematic constraints.                                                            |
-| Constraints | Boundary poses, obstacle-avoidance safety margins, velocity/angular/acceleration limits, etc.                      |
-| Solving     | Adaptively adjust the number of trajectory points and return the optimized trajectory along with its time profile. |
+np.linalg.norm( u[t - 1]) ** 2  这个是将上一次的控制序列所有元素求平方和，目的是为了惩罚较大的控制量,使得控制序列不会太大，使得车辆较为稳定       
 
-# Prerequisite
 
-- `python = 3.9`
-- `ir-sim = 2.5.0`
-- `casadi = 3.7.0`
+### step1 生成噪声，
 
-# Installation
 
-```bash
-git clone https://github.com/whsleep/Minimal_TEB.git
-cd Minimal_TEB
-pip install -r requirements.txt
-```
+      epsilon = self._calc_epsilon(self.sigma, self.K, self.T, self.dim_u)
 
-# Run examples
 
-```shell
-python run.py
-```
 
-# Demonstration
+$v t = u t + ϵ t $ 在上次最优控制上加入噪声得到本次控制,$ ϵ t ∼ N (0, Σ) $噪声从属于高斯分布
 
-<img  src="pictures/20obs.gif" width="400" />
+.
 
-# Tutorial
-
-Here is a short Chinese tutorial [Trajectory Optimization](https://www.zhihu.com/column/c_1940366621676905723)
-
-# References
-
-- [RDA Planner](https://github.com/hanruihua/RDA-planner)
-
-  RDA Planner is a high-performance, optimization-based, Model Predictive Control (MPC) motion planner designed for autonomous navigation in complex and cluttered environments. Utilizing the Alternating Direction Method of Multipliers (ADMM), RDA decomposes complex optimization problems into several simple subproblems. This decomposition enables parallel computation of collision avoidance constraints for each obstacle, significantly enhancing computation speed.
-
-- [Intelligent Robot Simulator (IR-SIM)](https://github.com/hanruihua/ir-sim)
-
-  IR-SIM is an open-source, Python-based, lightweight robot simulator designed for navigation, control, and learning. It provides a simple, user-friendly framework with built-in collision detection for modeling robots, sensors, and environments. Ideal for academic and educational use, IR-SIM enables rapid prototyping of robotics and AI algorithms in custom scenarios with minimal coding and hardware requirements.
-
-- [AutoNavRL](https://github.com/harshmahesheka/AutoNavRL)
-
-  This project implements a reinforcement learning-based robot navigation system that enables autonomous navigation in complex environments with obstacles.
-
-- [teb_local_planner](https://github.com/gogongxt/teb_local_planner)
-
-  Transplanted the official teb source code to achieve common optimization and multi-path optimization.

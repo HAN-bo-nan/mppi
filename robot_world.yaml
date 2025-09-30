@@ -1,6 +1,6 @@
 world:
-  height: 10
-  width: 10
+  height: 50
+  width: 50
   step_time: 0.1
   sample_time: 0.1
   offset: [0, 0]
@@ -9,11 +9,11 @@ world:
 
 
 robot:
-  - kinematics: {name: 'acker'}
-    shape: {name: 'rectangle', length: 0.4, width: 0.2 , wheelbase: 0.25}
-    state: [1.5, 8.5, 0, 0]
-    goal: [8.5, 1.5, 135]
-    goal_threshold: 0.1
+  - kinematics: {name: 'diff'}
+    shape: {name: 'rectangle', length: 1.5, width: 0.8 , wheelbase: 0 }
+    state: [10, 40, 0]
+    goal: [29,18]
+    goal_threshold: 2
 
     sensors:
       - type: 'lidar2d'
@@ -31,14 +31,15 @@ robot:
       show_trail: true
       show_goal: true
 
-#obstacle:
-#  - number: 20
-#    kinematics: {name: 'omni'}
-#    distribution: {name: 'random', range_low: [1.5, 1.5, -3.14], range_high: [8.5, 8.5, 3.14]}
-#    behavior: {name: 'rvo', wander: True, range_low: [1.5, 1.5, -3.14], range_high: [8.5, 8.5, 3.14], vxmax: 0.5, vymax: 0.5, factor: 1.0}
-#    vel_max: [0.5, 0.5]
-#    vel_min: [-0.5, -0.5]
-#    shape:
-#    shape:
-#      - {name: 'circle', radius: 0.3, random_shape: False}
-#      - {name: 'polygon', random_shape: true, avg_radius_range: [0.2, 0.3], irregularity_range: [0, 0.2], spikeyness_range: [0, 0.2], num_vertices_range: [4, 6]}
+# obstacle:
+#   - number: 20
+#     kinematics: {name: 'omni'}
+#     distribution: {name: 'random', range_low: [1.5, 1.5, -3.14], range_high: [8.5, 8.5, 3.14]}
+#     behavior: {name: 'rvo', wander: True, range_low: [1.5, 1.5, -3.14], range_high: [8.5, 8.5, 3.14], vxmax: 0.5, vymax: 0.5, factor: 1.0}
+#     vel_max: [0.5, 0.5]
+#     vel_min: [-0.5, -0.5]
+#     shape:
+#     shape:
+#       - {name: 'circle', radius: 0.3, random_shape: False}
+#       - {name: 'polygon', random_shape: true, avg_radius_range: [0.2, 0.3], irregularity_range: [0, 0.2], spikeyness_range: [0, 0.2], num_vertices_range: [4, 6]}
+

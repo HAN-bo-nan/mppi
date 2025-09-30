@@ -1,307 +1,233 @@
-
 import numpy as np
 import math
-from matplotlib import pyplot as plt
 
 class MppiplanSolver:
-    """局部规划求解器（支持障碍约束自适应、轨迹点数量自动调整）"""
+    """局部规划求解器（标准MPPI实现，适配 [linear_vel, angular_vel] 控制输入）"""
     
-    def __init__(self, x0, xf,xg, obstacles=None, n=None, safe_distance=0.80,
-                 v_max=1.0, omega_max=1.0, r_min=0.5, a_max=2.0, epsilon=1e-2,
-                 w_p=0.5, w_t=1.0, w_kin=4.0, w_r=4.0, w_obs=10.0, T_min=0.05, T_max=0.2):
-        """
-        初始化路径规划求解器
-        
-        参数:
-            x0: 起点坐标和姿态 [x, y, yaw,w]
-            xf: 终点坐标和姿态 [x, y, yaw,w]
-            obstacles: 障碍物坐标数组，形状为 (m, 2)，空数组表示无障碍
-            n: 中间点数(None时自动计算)
-            ... 其他参数同前 ...
-        """
-        self.dim_x = 4  # 状态维度 [x,y,yaw,v]
-        self.dim_u = 2  # 控制维度 [steer,accel]
-        self.T = 10  # 预测时域长度（步数）
-        self.K = 100  # 采样数量K（生成K条轨迹）
-        self.param_exploration = 0.0  # 探索率（0~1，比例越高探索越强）
-        self.param_lambda = 100.0  # 温度参数（控制权重分布陡峭度）
-        self.param_alpha = 0.98  # 衰减因子（控制历史信息保留程度）
-        self.sigma = np.array([[0.075, 0.0], [0.0, 2.0]])  # 控制噪声协方差矩阵Σ（控制探索强度）
-        self.stage_cost_weight = np.array([50.0, 50.0, 1.0, 20.0])  # 阶段成本权重矩阵
-        self.input_cost_weight = 1.0  # 输入成本权重矩阵
-        self.terminal_cost_weight = np.array([100.0, 100.0, 100.0, 20.0])  # 终端成本权重矩阵
-        self.max_search_idx_len = 50  # 搜索最近参考点索引长度
-        # self.visualize_sampled_trajs = True  # 是否可视化采样轨迹
-        # self.visualize_optimal_traj = True  # 是否可视化最优轨迹
-        self.obstacle_cost_weight = 50.0  # 障碍物代价权重
-        self.safety_margin = 1.0  # 安全裕度
-        self.max_repulsive_force = 15.0  # 最大斥力
+    def __init__(self, x0, xf, xg, obstacles=None):
+        self.dim_x = 3  # 状态维度 [x, y, yaw]
+        self.dim_u = 2  # 控制维度 [linear_vel, angular_vel]
+        self.T = 20     # 预测时域长度（步数）
+        self.K = 500    # 采样数量K（生成K条轨迹）
+        self.param_lambda = 0.5  # 温度参数（控制权重分布陡峭度）
+        self.param_alpha = 0.0   # 标准MPPI通常不使用带衰减的记忆更新
 
-        self.u_prev = np.zeros((self.T, self.dim_u))
+        # --- 关键调整 1: 噪声协方差 sigma ---
+        # 针对 [linear_vel, angular_vel] 调整
+        # 初始值设小一些，避免过大的随机探索
+        # 示例: 线速度标准差 0.5 m/s, 角速度标准差 10 deg/s
+        self.sigma = np.array([[0.5**2, 0.0], [0.0, np.deg2rad(10.0)**2]]) 
+        # -----------------------------------
 
+        # --- 关键调整 2: 成本权重 ---
+        # 增加对控制输入的惩罚，平衡状态追踪
+        self.stage_cost_weight = np.array([20.0, 20.0, 10.0])  # [x, y, theta] - 可根据需要调整
+        self.input_cost_weight = np.array([1.0, 0.5])          # [V, W] - 增大以抑制过大输入
+        self.terminal_cost_weight = np.array([50.0, 50.0, 20.0]) # [x, y, theta] - 终端更严格
+        # --------------------------
+
+        # --- 保留但可能未使用的参数 ---
+        self.max_search_idx_len = 50
+        self.obstacle_cost_weight = 50.0
+        self.safety_margin = 1.0
+        self.max_repulsive_force = 15.0
+        # -----------------------------
+
+        # --- 关键调整 3: 控制输入限制 (对应 [V, W]) ---
+        # 根据你的系统物理限制设置
+        self.max_linear_vel_abs = 2.0  # m/s (示例，请根据你的机器人/车辆调整)
+        self.max_angular_vel_abs = np.deg2rad(45.0) # rad/s (示例，请根据你的机器人/车辆调整)
+        # ---------------------------------------------
+
+        self.u_prev = np.zeros((self.T, self.dim_u)) # 历史控制序列
+
+        # --- 保留但可能未使用的参数 ---
         self.pre_waypoints_idx = 0
-
-        self.max_steer_abs = np.deg2rad(30.0)  # 最大转向角（弧度）
-        self.max_accel_abs = 2.0  # 最大加速度
-
+        self.pi = 3.1415926
+        self.wheel_base = 2.5 # 如果 _next_x 用到，需要调整
+        # -----------------------------
 
         self.x0 = np.array(x0)
-        self.xf = np.array(xf)
-        self.xg = np.array(xg)
+        self.xf = np.array(xf) # 目标状态
+        self.xg = np.array(xg) # 可能是全局路径点或目标点
 
         self.obstacles = obstacles
-        self.wheel_base = 2.5
-        self.delta_t = 0.1
-        # 自动计算轨迹点数量n（若未指定）
-        # self.n = self._auto_calculate_n() if n is None else n
-        # self.n = max(5, self.n)  # 确保最少5个中间点
-        self.param_gamma = self.param_lambda * (1.0 - (self.param_alpha))
+        self.delta_t = 0.1 # 时间步长
         
         # 求解结果
         self.trajectory = None
         self.solver_result = None
         self.cost = None
 
+    def calc_control_input(self, x0=None, xf=None, xg=None):
+        """计算控制输入 (标准MPPI流程)"""
+        # 1. 使用上一时刻的控制序列作为基础 (状态前馈)
+        u = self.u_prev.copy() 
 
-    def _obstacle_cost(self, x, y):
-        """计算障碍物斥力代价"""
-        total_cost = 0.0
-        if self.obstacles is not None:
-            for obstacle in self.obstacles:
-                d = obstacle.distance_to(x, y)
-                effective_radius = obstacle.radius + self.safety_margin
-
-                if d < effective_radius:
-                    # 指数增长的斥力代价，距离越近代价越高
-                    repulsion = self.max_repulsive_force * (1 - d / effective_radius) ** 2
-                    total_cost += repulsion
-
-        return total_cost
-
-    def calc_control_input(self, x0,xf,xg):
-        """计算控制输入"""
-        u = self.u_prev
+        # 更新内部状态（如果外部提供了）
         if x0 is not None:
             self.x0 = np.array(x0)
         if xf is not None:
             self.xf = np.array(xf)
         if xg is not None:
-            self.xf = np.array(xg)
+            self.xg = np.array(xg)
 
+        x0 = self.x0 # 使用当前内部状态
 
+        # 2. 初始化成本和噪声
+        S = np.zeros(self.K) # 每条轨迹的成本
+        epsilon = self._calc_epsilon(self.sigma, self.K, self.T, self.dim_u) # 生成噪声
 
-
-        # nearest_idx, _, _, _, _ = self._get_nearest_waypoint(x0[0], x0[1], update_prev_idx=True
-        # 判断是否到达终点区域（仅基于参考路径索引）
-        # arrived = nearest_idx >= self.ref_path_end_idx - 2  # 允许终点前2个点的误差
-
-        # if arrived:
-        #     print("Reached the end of the reference path.")
-        #     return None, None, None, None, arrived
-
-        # 初始化轨迹成本数组
-        S = np.zeros((self.K))
-        #
-        # 1. 采样噪声序列
-        epsilon = self._calc_epsilon(self.sigma, self.K, self.T, self.dim_u)
-        # epsilon[:] = 0
-        #
-        # 初始化带噪声的控制序列
+        # 3. 采样与前向模拟 (Rollout)
         v = np.zeros((self.K, self.T, self.dim_u))
+        sampled_traj_list = np.zeros((self.K, self.T, self.dim_x)) # 存储所有采样轨迹
 
-        # 2. 生成K条采样轨迹并计算成本
         for k in range(self.K):
-            x = x0
-            for t in range(1, self.T + 1):
-                # 根据探索率生成控制序列
-                if k < (1.0 - self.param_exploration) * self.K:
-                    v[k, t - 1] = u[t - 1] + epsilon[k, t - 1]
-                else:
-                    v[k, t - 1] = epsilon[k, t - 1]
-
-                # 限制控制输入范围
-                v_clamped = self._u_clamp(v[k, t - 1])
-                # 更新状态
+            x = x0.copy() # 从当前状态开始
+            for t in range(self.T):
+                # 添加噪声到名义控制输入
+                v[k, t] = u[t] + epsilon[k, t]
+                
+                # --- 关键点: 成本计算使用未裁剪的 v ---
+                S[k] += self._stage_cost(x) + self._input_cost(v[k, t]) 
+                # -------------------------------------
+                
+                # --- 关键点: 限制控制输入用于模拟 (防止物理上不可能的状态) ---
+                v_clamped = self._u_clamp(v[k, t].copy()) 
+                # -----------------------------------------------------------
+                
+                # 前向模拟一步
                 x = self._next_x(x, v_clamped)
-                # 累积成本
-                S[k] += 10*self._stage_cost(x) + self.input_cost_weight * np.linalg.norm( u[t - 1]) ** 2 + 10*self.param_gamma * u[t - 1].T @ np.linalg.inv(self.sigma) @ v[k, t - 1]
-            # self.input_cost_weight * np.linalg.norm( u[t - 1]) ** 2
-            # self.param_gamma * u[t - 1].T @ np.linalg.inv(self.sigma) @ v[k, t - 1]
+                sampled_traj_list[k, t] = x.copy() # 存储模拟的状态
+            
+            # 累积终端成本
+            S[k] += self._terminal_cost(x)
 
-            # 添加终端成本
-            S[k] += 10*self._terminal_cost(x)
-
-        # 3. 计算每条轨迹的权重
+        # 4. 计算权重
         w = self._calc_weights(S)
 
-        # 4. 加权更新控制序列
-        w_epsilon = np.zeros((self.T, self.dim_u))
-        for t in range(0, self.T):
-            for k in range(self.K):
-                # 把每一条路径上的某一步的所有噪声想加
-                w_epsilon[t] += w[k] * epsilon[k, t]
+        # 5. 更新控制序列 (标准MPPI更新)
+        u_new = np.zeros_like(u)
+        for t in range(self.T):
+             weighted_epsilon_sum = np.zeros(self.dim_u)
+             for k in range(self.K):
+                 weighted_epsilon_sum += w[k] * epsilon[k, t]
+             u_new[t] = u[t] + weighted_epsilon_sum 
 
-        # 控制序列平滑
-        w_epsilon = self._moving_average_filter(w_epsilon, 10)
-        u += w_epsilon
+        # 6. 滚动更新 u_prev
+        self.u_prev[:-1] = u_new[1:]
+        self.u_prev[-1] = u_new[-1] # 末尾保持最后一个控制
 
-        # 计算最优轨迹
+        # 7. 计算(近似)最优轨迹用于返回 (使用更新后的控制序列)
         optimal_traj = np.zeros((self.T, self.dim_x))
-        if True:
-            x = x0
-            for t in range(0, self.T):
-                x = self._next_x(x, self._u_clamp(u[t]))
-                optimal_traj[t] = x
-        xy = optimal_traj[:, :2]  # 20×2，第0列x，第1列y
-        x = xy[:, 0]  # x坐标
-        y = xy[:, 1]  # y坐标
+        x = x0.copy()
+        for t in range(self.T):
+            u_clamped = self._u_clamp(u_new[t].copy())
+            x = self._next_x(x, u_clamped)
+            optimal_traj[t] = x
 
+        xy = optimal_traj[:, :2]  # 提取 x, y 坐标
 
+        # 返回值保持接口一致
+        return u_new[0], u_new, xy, sampled_traj_list
 
-
-
-        # plt.figure(figsize=(6, 4))
-        # plt.plot(x, y, '-o')  # 连线+标点
-        # plt.xlabel('X')
-        # plt.ylabel('Y')
-        # plt.title('20-points XY curve')
-        # plt.axis('equal')  # 可选：x/y等比例
-        # plt.grid(True)
-        # plt.show()
-
-        # 计算采样轨迹（按成本排序）
-        sampled_traj_list = np.zeros((self.K, self.T, self.dim_x))
-        sorted_idx = np.argsort(S)  # 按成本升序排序
-        if True:
-            for k in sorted_idx:
-                x = x0
-                for t in range(0, self.T):
-                    x = self._next_x(x, self._u_clamp(v[k, t]))
-                    sampled_traj_list[k, t] = x
-
-        # 5. 控制序列滚动
-        self.u_prev[:-1] = u[1:]
-        self.u_prev[-1] = u[-1]
-
-        return u[0], u, xy,sampled_traj_list
-
-    def _moving_average_filter(self, xx, window_size):
-        """移动平均滤波器，平滑控制序列"""
-        b = np.ones(window_size) / window_size
-        dim = xx.shape[1]
-        xx_mean = np.zeros(xx.shape)
-
-        for d in range(dim):
-            xx_mean[:, d] = np.convolve(xx[:, d], b, mode="same")
-            n_conv = math.ceil(window_size / 2)
-            xx_mean[0, d] *= window_size / n_conv
-            for i in range(1, n_conv):
-                xx_mean[i, d] *= window_size / (i + n_conv)
-                xx_mean[-i, d] *= window_size / (i + n_conv - (window_size % 2))
-        return xx_mean
-
-    def _calc_weights(self, S):
-        """计算各采样轨迹的权重"""
-        rho = S.min()
-        eta = 0.0
-        for k in range(self.K):
-            eta += np.exp((-1.0 / self.param_lambda) * (S[k] - rho))
-
-        w = np.zeros((self.K))
-        for k in range(self.K):
-            w[k] = (1.0 / eta) * np.exp((-1.0 / self.param_lambda) * (S[k] - rho))
-        return w
+    def _calc_weights(self, costs):
+        """计算各采样轨迹的权重 (标准MPPI)"""
+        min_cost = np.min(costs)
+        # 提高数值稳定性
+        exp_terms = np.exp((-1.0 / self.param_lambda) * (costs - min_cost))
+        weights = exp_terms / (np.sum(exp_terms) + 1e-10) # 防止除零
+        return weights
 
     def _terminal_cost(self, x_T):
         """计算终端成本"""
-        x, y, yaw, v = x_T
-        yaw = ((yaw + 2.0 * np.pi) % (2.0 * np.pi))
-
-        # _, ref_x, ref_y, ref_yaw, ref_v = self._get_nearest_waypoint(x, y)
-        terminal_cost = self.terminal_cost_weight[0] * (x - self.xg[0]) ** 2 + \
-                        self.terminal_cost_weight[1] * (y - self.xg[1]) ** 2 + \
-                        self.terminal_cost_weight[2] * (yaw - 5.498) ** 2  + \
-                        self.terminal_cost_weight[3] * (v - 0) ** 2
-        # obstacle_cost = self.obstacle_cost_weight * self._obstacle_cost(x, y)
+        x, y, theta = x_T
+        dx = x - self.xf[0]
+        dy = y - self.xf[1]
+        dtheta = self.WrapToPi(theta - self.xf[2])
+        terminal_cost = (self.terminal_cost_weight[0] * dx**2 +
+                         self.terminal_cost_weight[1] * dy**2 +
+                         self.terminal_cost_weight[2] * dtheta**2)
         return terminal_cost
 
     def _stage_cost(self, x_t):
-        """计算阶段成本"""
-        x, y, yaw, v = x_t
-        yaw = ((yaw + 2.0 * np.pi) % (2.0 * np.pi))
-
-
-        stage_cost = self.stage_cost_weight[0] * (x - self.xf[0]) ** 2 + \
-                     self.stage_cost_weight[1] * (y - self.xf[1]) ** 2 + \
-                     self.stage_cost_weight[2] * (yaw - 5.498) ** 2 
-                     # self.stage_cost_weight[3] * (v - ref_v) ** 2
-
-        # obstacle_cost = self.obstacle_cost_weight * self._obstacle_cost(x, y)
-
+        """计算阶段成本 (到目标状态 xf 的偏差)"""
+        x, y, theta = x_t
+        dx = x - self.xf[0]
+        dy = y - self.xf[1]
+        dtheta = self.WrapToPi(theta - self.xf[2]) # 角度差需要特殊处理
+        stage_cost = (self.stage_cost_weight[0] * dx**2 +
+                      self.stage_cost_weight[1] * dy**2 +
+                      self.stage_cost_weight[2] * dtheta**2)
         return stage_cost
 
-    # def _next_x(self, x_t, v_t):
-    #     """计算下一时刻状态（运动学模型）"""
-    #     x, y, yaw, v = x_t
-    #     steer, accel = v_t
+    def _input_cost(self, u_t):
+        """计算控制输入成本 (惩罚控制量大小)"""
+        # 假设权重是向量，与 u_t 对应元素相乘
+        input_cost = self.input_cost_weight[0] * u_t[0]**2 + self.input_cost_weight[1] * u_t[1]**2
+        return input_cost
 
-    #     l = self.wheel_base
-    #     dt = self.delta_t
+    def _next_x(self, x_t: np.ndarray, u_t: np.ndarray) -> np.ndarray:
+        """系统动力学模型 (差分驱动/简单移动机器人模型)"""
+        x_t = np.asarray(x_t).ravel()
+        u_t = np.asarray(u_t).ravel()
+        
+        linear_vel, angular_vel = u_t[0], u_t[1] # u[0]是线速度V, u[1]是角速度W
+        x, y, theta = x_t
 
-    #     new_x = x + v * np.cos(yaw) * dt
-    #     new_y = y + v * np.sin(yaw) * dt
-    #     new_yaw = yaw + v / l * np.tan(steer) * dt
-    #     new_v = v + accel * dt
+        # 简单的欧拉积分差分驱动模型
+        new_x = x + linear_vel * np.cos(theta) * self.delta_t
+        new_y = y + linear_vel * np.sin(theta) * self.delta_t
+        new_theta = theta + angular_vel * self.delta_t
+        new_theta = self.WrapToPi(new_theta) # 角度归一化很重要
 
-    #     return np.array([new_x, new_y, new_yaw, new_v])
-    def _next_x(self, x_t: np.ndarray, v_t: list) -> np.ndarray:
-        """
-        对外接口保持第二种形式：
-        x_t = [x, y, yaw, v]        # 4×1 或 4 维向量
-        v_t = [steer, accel]        # 2 维列表/数组
-        返回 4×1 或 1 维向量（与输入形状一致）
-        """
-        # 统一转 1-D 数组，最后再 reshape 回去
-        x_t   = np.asarray(x_t).ravel()
-        steer, accel = v_t[0], v_t[1]
-
-        x, y, yaw, v = x_t
-
-        # 内部状态扩展：把当前真实转角 δ 存在最后一个元素
-        # 第一次调用时若长度=4，自动补 δ=0
-        if len(x_t) == 4:
-            delta = 0.0
-        else:
-            delta = x_t[4]
-
-        # 1. 转向一阶动态  δ̇ = (steer - δ)/τ
-        delta_dot = (steer - delta) / 0.05
-        new_delta = delta + delta_dot * self.delta_t
-
-        # 2. 速度积分
-        new_v = v + accel * self.delta_t
-
-        # 3. 运动学
-        new_x   = x + v * np.cos(yaw) * self.delta_t
-        new_y   = y + v * np.sin(yaw) * self.delta_t
-        new_yaw = yaw + v / self.wheel_base * np.tan(new_delta) * self.delta_t
-
-        # 4. 角度归一化
-        new_yaw = np.arctan2(np.sin(new_yaw), np.cos(new_yaw))
-
-        # 5. 返回形状与输入一致（4 维，隐藏 δ）
-        return np.array([new_x, new_y, new_yaw, new_v]).reshape(np.asarray(x_t).shape)
+        return np.array([new_x, new_y, new_theta]).reshape(x_t.shape)
 
     def _u_clamp(self, u):
-        """限制控制输入在可行范围内"""
-        u[0] = np.clip(u[0], -self.max_steer_abs, self.max_steer_abs)
-        u[1] = np.clip(u[1], -self.max_accel_abs, self.max_accel_abs)
+        """限制控制输入在可行范围内 ([V, W])"""
+        # 使用为 [V, W] 定义的限制值
+        u[0] = np.clip(u[0], -self.max_linear_vel_abs, self.max_linear_vel_abs) # 限制线速度 V
+        u[1] = np.clip(u[1], -self.max_angular_vel_abs, self.max_angular_vel_abs) # 限制角速度 W
         return u
 
     def _calc_epsilon(self, sigma, K, T, dim_u):
-        """生成高斯噪声序列"""
-        mu = np.zeros((dim_u))
-        epsilon = np.random.multivariate_normal(mu, sigma, (K, T))
-        return epsilon
+        """生成高斯噪声序列 (标准MPPI核心)"""
+        return np.random.multivariate_normal(np.zeros(dim_u), sigma, (K, T))
+
+    def WrapToPi(self, rad: float) -> float:
+        """将角度转换到 [-pi, pi] 范围内 (使用NumPy更高效)"""
+        res = (rad + np.pi) % (2 * np.pi) - np.pi
+        return res
+
+
+# --- 简单测试代码 (可选) ---
+# if __name__ == '__main__':
+#     # 初始状态 [x, y, theta]
+#     x0 = np.array([0.0, 0.0, 0.0])
+#     # 目标状态 [x, y, theta]
+#     xf = np.array([5.0, 3.0, np.pi/2])
+#     # 全局目标点 (如果需要)
+#     xg = np.array([5.0, 3.0])
+#
+#     solver = MppiplanSolver(x0, xf, xg)
+#
+#     # 模拟几步看看控制输出
+#     for i in range(5):
+#         print(f"\n--- Iteration {i} ---")
+#         u_first, u_seq, traj_xy, sampled_trajs = solver.calc_control_input()
+#         print(f"First control input (V, W): {u_first}")
+#         print(f"Current state estimate: {solver.x0}")
+#         # 假设应用了控制并前进了
+#         # 这里模拟状态更新 (实际应用中由传感器/定位提供)
+#         # next_state = solver._next_x(solver.x0, u_first)
+#         # solver.x0 = next_state
+#         # print(f"Next state estimate: {next_state}")
+#         
+#         # 检查一下权重分布，看看是否有明显的最优轨迹
+#         # (需要访问内部S或修改代码返回S)
+#         # print(f"Min/Max Cost: {np.min(solver.S)}, {np.max(solver.S)}") 
+#         # print(f"Max Weight: {np.max(solver.w)}")
+
+
 
 
